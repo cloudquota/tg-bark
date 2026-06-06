@@ -3,12 +3,13 @@ import re
 import json
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
-from telethon.tl.types import User, Chat, Channel
+from telethon import TelegramClient, events, functions
+from telethon.tl.types import User, Chat, Channel, InputNotifyPeer
 
 
 load_dotenv()
@@ -135,9 +136,40 @@ async def is_reply_to_me(event) -> bool:
         return False
 
 
+async def is_chat_muted(event) -> bool:
+    """检查当前对话在 Telegram 客户端中是否被静音。"""
+    try:
+        input_peer = await event.get_input_chat()
+        result = await client(
+            functions.account.GetNotifySettingsRequest(
+                peer=InputNotifyPeer(peer=input_peer)
+            )
+        )
+        mute_until = getattr(result, "mute_until", None)
+        if mute_until is None:
+            return False
+        # mute_until 为 datetime，如果在未来则表示已静音
+        # Telegram 永久静音时 mute_until 通常设为一个很远的未来时间 (2147483647)
+        if isinstance(mute_until, int):
+            return mute_until > int(datetime.now(timezone.utc).timestamp())
+        if isinstance(mute_until, datetime):
+            now = datetime.now(timezone.utc)
+            if mute_until.tzinfo is None:
+                mute_until = mute_until.replace(tzinfo=timezone.utc)
+            return mute_until > now
+        return False
+    except Exception as e:
+        logging.warning("检查对话静音状态失败: %s", e)
+        return False
+
+
 async def should_push(event) -> tuple[bool, str]:
     if event.out and not PUSH_SELF_MESSAGES:
         return False, "忽略自己发出的消息"
+
+    # 检查对话是否在 Telegram 中被静音
+    if await is_chat_muted(event):
+        return False, "对话已静音"
 
     if event.is_private:
         return True, "私聊"
