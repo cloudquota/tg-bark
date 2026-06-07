@@ -252,7 +252,7 @@ async def push_bark(title: str, body: str, url: Optional[str] = None) -> bool:
         "body": body,
         "group": "Telegram",
         "sound": "healthnotification",
-        "icon": "https://cdn.nodeimage.com/i/zjy7G6Nv4ENdd927CAN8D0AY5WXDG2iw.webp",
+        "icon": "https://telegram.org/img/website_icon.svg",
     }
 
     if url:
