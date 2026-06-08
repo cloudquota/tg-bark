@@ -2,7 +2,6 @@ import os
 import re
 import json
 import asyncio
-import logging
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -23,17 +22,13 @@ BARK_SERVER = os.getenv("BARK_SERVER", "https://api.day.app").rstrip("/")
 
 MY_USERNAME = os.getenv("MY_USERNAME", "").lstrip("@").lower()
 
-MAX_BODY_LEN = int(os.getenv("MAX_BODY_LEN", "500"))
 PUSH_SELF_MESSAGES = os.getenv("PUSH_SELF_MESSAGES", "false").lower() == "true"
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
 client = TelegramClient(TG_SESSION, TG_API_ID, TG_API_HASH)
+http_session: Optional[aiohttp.ClientSession] = None
+_me_cache: Optional[User] = None
 
 
 def load_state() -> dict:
@@ -43,8 +38,7 @@ def load_state() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception as e:
-        logging.warning("读取状态文件失败，使用默认开启状态: %s", e)
+    except Exception:
         return {"push_enabled": True}
 
 
@@ -62,13 +56,6 @@ def set_push_enabled(enabled: bool):
     state = load_state()
     state["push_enabled"] = enabled
     save_state(state)
-
-
-def shorten(text: str, limit: int = MAX_BODY_LEN) -> str:
-    text = (text or "").replace("\n", " ").strip()
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "..."
 
 
 def display_name(entity) -> str:
@@ -90,27 +77,6 @@ def display_name(entity) -> str:
     return getattr(entity, "title", None) or getattr(entity, "username", None) or "未知"
 
 
-def message_summary(event) -> str:
-    msg = event.message
-
-    if event.raw_text:
-        return shorten(event.raw_text)
-
-    if msg.photo:
-        return "[图片]"
-    if msg.video:
-        return "[视频]"
-    if msg.voice:
-        return "[语音]"
-    if msg.audio:
-        return "[音频]"
-    if msg.document:
-        return "[文件]"
-    if msg.sticker:
-        return "[贴纸]"
-
-    return "[非文本消息]"
-
 
 def has_username_mention(text: str) -> bool:
     if not MY_USERNAME or not text:
@@ -129,10 +95,8 @@ async def is_reply_to_me(event) -> bool:
         if not reply_msg:
             return False
 
-        me = await client.get_me()
-        return reply_msg.sender_id == me.id
-    except Exception as e:
-        logging.warning("检查回复消息失败: %s", e)
+        return reply_msg.sender_id == _me_cache.id
+    except Exception:
         return False
 
 
@@ -158,8 +122,7 @@ async def is_chat_muted(event) -> bool:
                 mute_until = mute_until.replace(tzinfo=timezone.utc)
             return mute_until > now
         return False
-    except Exception as e:
-        logging.warning("检查对话静音状态失败: %s", e)
+    except Exception:
         return False
 
 
@@ -188,6 +151,38 @@ async def should_push(event) -> tuple[bool, str]:
     return False, "非私聊且未@你"
 
 
+def generate_tg_link(event, chat, sender) -> str:
+    """根据消息事件生成最精准的 Telegram 跳转 Scheme 链接。"""
+    try:
+        # 1. 私聊情况
+        if event.is_private:
+            if isinstance(sender, User) and getattr(sender, "username", None):
+                return f"tg://resolve?domain={sender.username}"
+            if sender:
+                return f"tg://openmessage?user_id={sender.id}"
+            return "tg://"
+
+        # 2. 群组或频道情况
+        # 优先使用公开的 username，可以精准定位到具体消息
+        if chat and getattr(chat, "username", None):
+            return f"tg://resolve?domain={chat.username}&post={event.message.id}"
+
+        # 针对无 username 的私有群组/频道
+        if chat:
+            # Telethon 中超级群和频道都是 Channel 类型
+            if isinstance(chat, Channel):
+                return f"tg://privatepost?channel={chat.id}&post={event.message.id}"
+            # 普通小群是 Chat 类型
+            if isinstance(chat, Chat):
+                return f"tg://openmessage?chat_id={chat.id}"
+            return f"tg://openmessage?chat_id={chat.id}"
+
+    except Exception:
+        pass
+
+    return "tg://"
+
+
 async def handle_saved_messages_command(event) -> bool:
     """
     只处理 Telegram 收藏夹 / Saved Messages 里的命令。
@@ -204,9 +199,7 @@ async def handle_saved_messages_command(event) -> bool:
     if not event.is_private:
         return False
 
-    me = await client.get_me()
-
-    if event.chat_id != me.id:
+    if event.chat_id != _me_cache.id:
         return False
 
     text = (event.raw_text or "").strip().lower()
@@ -214,19 +207,16 @@ async def handle_saved_messages_command(event) -> bool:
     if text == "/on":
         set_push_enabled(True)
         await event.reply("✅ Bark 推送已开启")
-        logging.info("收到 Saved Messages 命令：开启推送")
         return True
 
     if text == "/off":
         set_push_enabled(False)
         await event.reply("🔕 Bark 推送已关闭")
-        logging.info("收到 Saved Messages 命令：关闭推送")
         return True
 
     if text == "/status":
         status = "开启 ✅" if is_push_enabled() else "关闭 🔕"
         await event.reply(f"当前 Bark 推送状态：{status}")
-        logging.info("收到 Saved Messages 命令：查看状态")
         return True
 
     if text == "/help":
@@ -238,13 +228,13 @@ async def handle_saved_messages_command(event) -> bool:
             "/help 查看帮助\n\n"
             "说明：这些命令只在 Telegram 收藏夹 / Saved Messages 里生效。"
         )
-        logging.info("收到 Saved Messages 命令：查看帮助")
         return True
 
     return False
 
 
 async def push_bark(title: str, body: str, url: Optional[str] = None) -> bool:
+    global http_session
     api_url = f"{BARK_SERVER}/{BARK_KEY}"
 
     payload = {
@@ -260,21 +250,13 @@ async def push_bark(title: str, body: str, url: Optional[str] = None) -> bool:
 
     for i in range(3):
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(api_url, json=payload, timeout=10) as resp:
-                    resp_text = await resp.text()
-                    if resp.status == 200:
-                        logging.info("Bark推送成功: %s", title)
-                        return True
-
-                    logging.warning(
-                        "Bark推送失败，第%s次，HTTP=%s，返回=%s",
-                        i + 1,
-                        resp.status,
-                        resp_text,
-                    )
-        except Exception as e:
-            logging.warning("Bark请求异常，第%s次: %s", i + 1, e)
+            if http_session is None or http_session.closed:
+                http_session = aiohttp.ClientSession()
+            async with http_session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            pass
 
         await asyncio.sleep(2)
 
@@ -288,12 +270,10 @@ async def on_new_message(event):
             return
 
         if not is_push_enabled():
-            logging.debug("Bark推送当前已关闭，跳过")
             return
 
         ok, reason = await should_push(event)
         if not ok:
-            logging.debug("跳过消息: %s", reason)
             return
 
         chat = await event.get_chat()
@@ -311,33 +291,34 @@ async def on_new_message(event):
         else:
             body = f"{chat_name}\n{sender_name}: {content}"
 
-        logging.info("准备推送: %s | %s", title, body)
-        await push_bark(title, body, "tg://")
+        tg_link = generate_tg_link(event, chat, sender)
+        await push_bark(title, body, tg_link)
 
-    except Exception as e:
-        logging.exception("处理消息失败: %s", e)
+    except Exception:
+        pass
 
 
 async def main():
+    global http_session
+
     if not TG_API_ID or not TG_API_HASH:
         raise RuntimeError("请先在 .env 里配置 TG_API_ID 和 TG_API_HASH")
 
     if not BARK_KEY:
         raise RuntimeError("请先在 .env 里配置 BARK_KEY")
 
-    logging.info("启动 Telegram -> Bark 监听程序")
-    logging.info("当前 Bark 推送状态: %s", "开启" if is_push_enabled() else "关闭")
+    http_session = aiohttp.ClientSession()
 
-    await client.start()
+    try:
+        await client.start()
 
-    me = await client.get_me()
-    logging.info(
-        "已登录 Telegram: id=%s username=%s",
-        me.id,
-        getattr(me, "username", None),
-    )
+        global _me_cache
+        _me_cache = await client.get_me()
 
-    await client.run_until_disconnected()
+        await client.run_until_disconnected()
+    finally:
+        if http_session and not http_session.closed:
+            await http_session.close()
 
 
 if __name__ == "__main__":
