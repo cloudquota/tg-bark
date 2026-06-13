@@ -11,7 +11,7 @@ from telethon import TelegramClient, events, functions
 from telethon.tl.types import User, Chat, Channel, InputNotifyPeer
 
 
-load_dotenv()
+load_dotenv("env")
 
 TG_API_ID = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH = os.getenv("TG_API_HASH", "")
@@ -302,10 +302,10 @@ async def main():
     global http_session
 
     if not TG_API_ID or not TG_API_HASH:
-        raise RuntimeError("请先在 .env 里配置 TG_API_ID 和 TG_API_HASH")
+        raise RuntimeError("请先在 env 里配置 TG_API_ID 和 TG_API_HASH")
 
     if not BARK_KEY:
-        raise RuntimeError("请先在 .env 里配置 BARK_KEY")
+        raise RuntimeError("请先在 env 里配置 BARK_KEY")
 
     http_session = aiohttp.ClientSession()
 
